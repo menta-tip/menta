@@ -1,8 +1,8 @@
 # MENTA Tip — Developer API
 
-Build on the candy jar. Read balances, send tips, run drops and rains, and get a
-signed webhook when anything happens — from your bot, your game, your website,
-or your Telegram bot.
+Build on the candy jar. Read balances, send tips, run drops and rains, read the
+live liquidity pools, and get a signed webhook when anything happens — from your
+bot, your game, your website, or your Telegram bot.
 
 **Free.** No fee on tips, drops, rains or games. Base URL `https://menta.tips/v1`.
 
@@ -131,6 +131,85 @@ you cannot tell which half went through without diffing balances.
 
 **A link is a forwarding address, not a login.** It lets you *pay* that person
 and nothing else — no reading their balance, no spending it, no acting as them.
+
+
+## MENTA Pots — pools whose two sides are on different chains
+
+A **pot** is a constant-product liquidity pool (`x · y = k`) that lives on
+MENTA's internal ledger rather than on a chain. Anyone can open one, anyone can
+fund one, anyone can trade against it, and every trade leaves a fee behind for
+whoever put the liquidity up.
+
+Because both sides are ledger entries rather than contract state, **the two
+halves of a pot do not have to be on the same chain**. Pot #1 holds CHAD on WAX
+against CHAD on Base — one pool, no bridge between the sides, no wrapped asset,
+no gas, and no mempool for anyone to front-run. Trades settle in about a second.
+
+That is the part we have not been able to find anywhere else. To be precise
+about what is and is not new:
+
+- **Cross-chain AMMs exist** — Symbiosis, Chainflip and others are cross-chain
+  protocols with their own validators and settlement.
+- **A Discord swap bot exists** — Swappy is a non-custodial front end that
+  routes `/swap` to the Chainflip protocol.
+- **tip.cc, the largest tipping bot, has no built-in swap at all** and points
+  people at third-party services to trade what they hold.
+
+What appears to be new is the combination: a pool that is *internal to the
+ledger*, therefore genuinely cross-chain without a bridge, that **anyone in a
+chat window can provide liquidity to** and earn from — with LP shares, fee
+accrual and reward emissions, operated entirely through Discord buttons.
+
+### Syrup — rewards poured over a pot
+
+A sponsor can pour a pile of tokens over any pot; it drips to that pot's backers
+by the second, in proportion to their share, for a fixed number of days, on top
+of the trading fee. **A pour is irreversible** — there is no code path that
+returns it to the sponsor. A reward that can be cancelled is not a reward.
+
+### The live feed
+
+Every open pot is published as unauthenticated JSON, refreshed every few
+seconds. No key needed:
+
+```bash
+curl -s https://menta.tips/api/stats.json | jq '.pots'
+```
+
+```jsonc
+[
+  {
+    "id": "1",
+    "a": { "symbol": "CHAD", "chain": "wax",  "amount": "2,040,636,028.0445" },
+    "b": { "symbol": "CHAD", "chain": "base", "amount": "1,969,323,008.90202677" },
+    "price": 0.965054,          // side B per 1 of side A
+    "usd": 40.21,               // total depth, both sides
+    "feeBps": 30,               // 0.30% of every trade, to the backers
+    "backers": 2,
+    "swaps": 0,
+    "chart": [0.9651, 0.9649],  // price after each trade, oldest first
+    "syrup": [
+      {
+        "symbol": "CHAD",
+        "total": "100,000,000",
+        "endsAt": "2026-10-01T18:10:22.692Z",
+        "daysLeft": 29.99,
+        "aprPct": 32.65
+      }
+    ]
+  }
+]
+```
+
+`amount` fields are display strings for the same reason every amount in this API
+is a string — see [Amounts are strings](#amounts-are-strings-always). Treat
+`aprPct` as indicative: it is the pour measured against the pot's *current*
+depth, so it falls as the pot grows.
+
+Pots are operated from Discord (`$pot` opens a panel with buttons for adding
+liquidity, withdrawing, trading and collecting syrup). There are no write
+endpoints for pots — money moves into and out of a pool only through a command
+run by the person who owns the balance, which is the same rule as withdrawals.
 
 ## Amounts are strings. Always.
 

@@ -152,8 +152,11 @@ about what is and is not new:
   protocols with their own validators and settlement.
 - **A Discord swap bot exists** — Swappy is a non-custodial front end that
   routes `/swap` to the Chainflip protocol.
-- **tip.cc, the largest tipping bot, has no built-in swap at all** and points
-  people at third-party services to trade what they hold.
+- **tip.cc, the bot that defined this category, is gone.** As of September 2026
+  its domain no longer resolves at all — the `.cc` registry still delegates it
+  to Cloudflare, but those nameservers refuse the zone, so there is no website
+  and no API. Even while it ran it had no built-in swap, and pointed people at
+  third-party services to trade what they held.
 
 What appears to be new is the combination: a pool that is *internal to the
 ledger*, therefore genuinely cross-chain without a bridge, that **anyone in a

@@ -1,0 +1,595 @@
+openapi: 3.1.0
+info:
+  title: MENTA Tip API
+  version: "1.0"
+  description: |
+    Read balances, send tips, run drops and rains, and receive signed webhooks.
+
+    **Withdrawals are deliberately absent.** Money leaves MENTA through exactly
+    one path — a Discord command, run by the person who owns the balance, with a
+    confirmation step. No API call reaches it. That is not an omission to fill
+    in later; it is the point.
+
+    Three limits bound every key: it spends only its owner's balance (there is
+    no `from` parameter anywhere), it works in one server, and it can carry a
+    daily ceiling per asset.
+
+    Amounts always travel as **strings**, both directions. A JSON number cannot
+    hold `3592961775.5232` without rounding it, and a payments API that rounds a
+    balance is wrong. Do arithmetic on `amount_base`, the exact integer in the
+    token's smallest unit.
+  license:
+    name: MIT
+  contact:
+    name: MENTA Tip
+    url: https://menta.tips/api
+
+servers:
+  - url: https://menta.tips/v1
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Account
+  - name: Money
+  - name: Links
+  - name: Webhooks
+
+paths:
+  /health:
+    get:
+      tags: [Account]
+      summary: Liveness, no key required
+      security: []
+      responses:
+        "200":
+          description: Up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  version: { type: string }
+                  time: { type: string, format: date-time }
+
+  /me:
+    get:
+      tags: [Account]
+      summary: Who this key is and what it may do
+      responses:
+        "200":
+          description: Key identity, limits and today's usage
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  key:
+                    type: object
+                    properties:
+                      prefix: { type: string, example: menta_live_ab12cd }
+                      label: { type: string, nullable: true }
+                  owner:
+                    type: object
+                    properties:
+                      discord_id: { type: string }
+                  guild_id: { type: string }
+                  permissions:
+                    type: object
+                    properties:
+                      read: { type: boolean }
+                      write: { type: boolean }
+                      withdraw:
+                        type: boolean
+                        description: Always false. There is no withdrawal route.
+                  limits:
+                    type: object
+                    properties:
+                      daily_cap_base: { type: string, nullable: true }
+                      requests_per_minute: { type: integer, example: 120 }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /balances:
+    get:
+      tags: [Account]
+      summary: Every token the key's owner holds
+      responses:
+        "200":
+          description: Balances
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  owner:
+                    type: object
+                    properties: { discord_id: { type: string } }
+                  balances:
+                    type: array
+                    items: { $ref: "#/components/schemas/Balance" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /assets:
+    get:
+      tags: [Account]
+      summary: Search listed tokens
+      parameters:
+        - { name: q, in: query, schema: { type: string }, example: usdc }
+        - { name: limit, in: query, schema: { type: integer, default: 25, maximum: 100 } }
+      responses:
+        "200":
+          description: Matching assets
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  assets:
+                    type: array
+                    items: { $ref: "#/components/schemas/Asset" }
+
+  /transactions:
+    get:
+      tags: [Account]
+      summary: The key owner's history, newest first
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 25, maximum: 100 } }
+        - name: before
+          in: query
+          schema: { type: string }
+          description: A transaction id from `next_before`, for the following page.
+      responses:
+        "200":
+          description: Transactions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  transactions:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: "#/components/schemas/Amount"
+                        - type: object
+                          properties:
+                            id: { type: string }
+                            kind: { type: string, example: tip }
+                            direction: { type: string, enum: [in, out] }
+                            created_at: { type: string, format: date-time }
+                            guild_id: { type: string, nullable: true }
+                            channel_id: { type: string, nullable: true }
+                  next_before: { type: string, nullable: true }
+
+  /guild:
+    get:
+      tags: [Account]
+      summary: The server this key belongs to
+      responses:
+        "200":
+          description: Guild settings and activity
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  guild: { type: object }
+                  active_members_30d: { type: integer }
+                  payouts_delivered: { type: integer }
+
+  /leaderboard:
+    get:
+      tags: [Account]
+      summary: Who has received the most in this server
+      parameters:
+        - { name: asset, in: query, required: true, schema: { type: string }, example: USDC }
+        - { name: limit, in: query, schema: { type: integer, default: 10, maximum: 50 } }
+      responses:
+        "200":
+          description: Ranked recipients
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset: { $ref: "#/components/schemas/Asset" }
+                  scope: { type: string, example: received_in_guild }
+                  leaderboard:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: "#/components/schemas/Amount"
+                        - type: object
+                          properties:
+                            rank: { type: integer }
+                            discord_id: { type: string }
+
+  /tips:
+    post:
+      tags: [Money]
+      summary: Send a tip
+      description: |
+        Address recipients either by Discord id (`to`) or by your own ids
+        (`to_external`) once they have linked. Every recipient gets `amount`.
+
+        If any `to_external` recipient has not linked yet, the call returns
+        `409 not_linked` with their link URLs and **nothing is sent** — not even
+        to the ones who had linked. Half-paying a list is worse than either
+        outcome.
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [asset]
+              properties:
+                to:
+                  oneOf:
+                    - { type: string }
+                    - { type: array, items: { type: string }, maxItems: 100 }
+                  description: Discord user id, or an array of them.
+                to_external:
+                  oneOf:
+                    - { type: string }
+                    - { type: array, items: { type: string }, maxItems: 100 }
+                  description: Your own ids, linked via `/links`.
+                asset: { type: string, example: USDC }
+                amount: { type: string, example: "500" }
+                amount_base: { type: string, description: Exact base units, instead of `amount`. }
+                channel_id: { type: string }
+      responses:
+        "200":
+          description: Sent (or replayed)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  duplicate: { type: boolean }
+                  replayed: { type: boolean }
+                  transfer_id: { type: string }
+                  asset: { $ref: "#/components/schemas/Asset" }
+                  recipients: { type: array, items: { type: string } }
+                  per_recipient: { $ref: "#/components/schemas/Amount" }
+                  total: { $ref: "#/components/schemas/Amount" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "402": { $ref: "#/components/responses/InsufficientFunds" }
+        "409": { $ref: "#/components/responses/NotLinked" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /drops:
+    post:
+      tags: [Money]
+      summary: Post a claimable drop in a channel
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel_id, asset]
+              properties:
+                channel_id: { type: string }
+                asset: { type: string }
+                amount: { type: string }
+                amount_base: { type: string }
+                minutes: { type: integer, default: 10, maximum: 1440 }
+                max_claims: { type: integer, description: "0 or omitted = unlimited" }
+                note: { type: string, maxLength: 200 }
+      responses:
+        "201":
+          description: Funded and queued for posting
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Amount"
+                  - type: object
+                    properties:
+                      ok: { type: boolean }
+                      drop_id: { type: string }
+                      channel_id: { type: string }
+                      expires_at: { type: string, format: date-time }
+                      posting: { type: string, example: queued }
+        "402": { $ref: "#/components/responses/InsufficientFunds" }
+
+  /drops/{id}:
+    get:
+      tags: [Money]
+      summary: A drop's status and claim count
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Drop
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  drop_id: { type: string }
+                  claims: { type: integer }
+                  status: { type: string, enum: [open, closing, settled, cancelled] }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /rain:
+    post:
+      tags: [Money]
+      summary: Split an amount between recently active members
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel_id, asset]
+              properties:
+                channel_id: { type: string }
+                asset: { type: string }
+                amount: { type: string }
+                amount_base: { type: string }
+                active_within_minutes: { type: integer, default: 30 }
+                max_recipients: { type: integer, default: 50, maximum: 200 }
+      responses:
+        "200":
+          description: Rained
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Amount"
+                  - type: object
+                    properties:
+                      ok: { type: boolean }
+                      recipients: { type: integer, nullable: true }
+
+  /links:
+    get:
+      tags: [Links]
+      summary: Which of your users have connected Discord
+      parameters:
+        - name: external_id
+          in: query
+          schema: { type: string }
+          description: Ask about one instead of listing all.
+      responses:
+        "200":
+          description: Link, or links
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Link"
+                  - type: object
+                    properties:
+                      links: { type: array, items: { $ref: "#/components/schemas/Link" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [Links]
+      summary: Mint (or look up) a link for one of your users
+      description: |
+        Calling this twice for the same person is safe: an already-linked user
+        comes back as `linked`, and a pending one keeps the URL it was given.
+
+        The `redirect_url` carries no identity — anyone can forge a GET to it, so
+        ask this API who linked, server side, rather than trusting the return.
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [external_id]
+              properties:
+                external_id: { type: string, example: "telegram:99887", maxLength: 190 }
+                label: { type: string }
+                redirect_url: { type: string, format: uri, description: Public https only. }
+      responses:
+        "201":
+          description: Pending — send them `link_url`
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  external_id: { type: string }
+                  status: { type: string, enum: [pending, linked] }
+                  link_url: { type: string, nullable: true }
+                  expires_in_hours: { type: integer, nullable: true }
+        "200": { description: Already linked }
+
+  /links/{external_id}:
+    delete:
+      tags: [Links]
+      summary: Forget the mapping
+      parameters:
+        - { name: external_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Removed }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /webhooks:
+    get:
+      tags: [Webhooks]
+      summary: Your subscriptions
+      responses:
+        "200":
+          description: Webhooks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  webhooks: { type: array, items: { $ref: "#/components/schemas/Webhook" } }
+    post:
+      tags: [Webhooks]
+      summary: Subscribe an endpoint to events
+      description: |
+        The response carries a `secret`, shown once. Every delivery is signed
+        `x-menta-signature: t=<unix>,v1=<hex>` — an HMAC-SHA256 over
+        `timestamp.body`. Verify against the RAW body and reject a timestamp
+        older than five minutes.
+
+        Failed deliveries retry after 30s, 2m, 10m, 1h and 6h.
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string, format: uri, description: Public https only. }
+                events:
+                  type: array
+                  description: Omit for everything.
+                  items:
+                    type: string
+                    enum: [tip.created, drop.created, drop.claimed, drop.settled,
+                           rain.created, deposit.credited, withdrawal.sent, trade.filled]
+      responses:
+        "201":
+          description: Subscribed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  id: { type: string }
+                  url: { type: string }
+                  events: { type: array, items: { type: string } }
+                  secret: { type: string, description: Shown once. }
+                  signature_header: { type: string, example: x-menta-signature }
+
+  /webhooks/{id}:
+    delete:
+      tags: [Webhooks]
+      summary: Unsubscribe
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Deleted }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer menta_live_...`
+
+        Create one with `$apikey new my-bot` in Discord; it is DM'd to you once.
+        Keep it on your server — a key in front-end code is a published key.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, maxLength: 128 }
+      description: |
+        Any string unique to this attempt. Retrying with the same one returns the
+        ORIGINAL response, marked `replayed`, instead of sending twice. Use
+        something that identifies the event — an event id, a message id, a job
+        id — not the moment you happened to call.
+
+  schemas:
+    Asset:
+      type: object
+      properties:
+        symbol: { type: string, example: USDC }
+        chain: { type: string, example: base }
+        decimals: { type: integer, example: 18 }
+        contract: { type: string, nullable: true }
+        emoji: { type: string, nullable: true }
+
+    Amount:
+      type: object
+      description: Always strings. Do arithmetic on `amount_base`.
+      properties:
+        amount: { type: string, example: "1,250.5" }
+        amount_base: { type: string, example: "1250500000000000000000" }
+
+    Balance:
+      allOf:
+        - $ref: "#/components/schemas/Asset"
+        - $ref: "#/components/schemas/Amount"
+        - type: object
+          properties:
+            usd: { type: number, nullable: true }
+
+    Link:
+      type: object
+      properties:
+        external_id: { type: string }
+        status: { type: string, enum: [pending, linked] }
+        discord_id: { type: string, nullable: true }
+        label: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        linked_at: { type: string, format: date-time, nullable: true }
+
+    Webhook:
+      type: object
+      properties:
+        id: { type: string }
+        url: { type: string }
+        events: { type: array, items: { type: string } }
+        enabled: { type: boolean }
+        failures: { type: integer }
+        last_error: { type: string, nullable: true }
+        last_delivered_at: { type: string, format: date-time, nullable: true }
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: insufficient_funds }
+            message: { type: string, example: You don't have enough USDC for that. }
+
+  responses:
+    Unauthorized:
+      description: Missing, malformed or revoked key
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    BadRequest:
+      description: Something in the request is wrong — the message says what
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    InsufficientFunds:
+      description: Not enough balance
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No such route, asset, drop, link or webhook
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotLinked:
+      description: A recipient has not connected Discord yet — nothing was sent
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Too many requests, or the key's daily cap is reached
+      headers:
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }

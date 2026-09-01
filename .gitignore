@@ -1,0 +1,7 @@
+# Nothing in this repository should ever hold a credential, but belt and braces.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+node_modules/
